@@ -251,9 +251,66 @@ map.on("load", async () => {
     paint: { "text-color": "#6b6256", "text-halo-color": "#fff", "text-halo-width": 1.2 } });
 
   wireInteractions();
-  await loadSettlement(DEFAULT_EKATTE, true);     // имоти + райони + сгради (инлайн setData)
-  await loadGranici();                            // граници (инлайн setData, СЛЕД землището)
+  await loadGranici();          // първо границите (нужни за GPS→землище + постоянен слой)
+  await locateAndLoad();        // GPS → землището под мен; fallback DEFAULT_EKATTE
 });
+
+// ---- Geolocation: отваря картата на текущите координати ----
+// Намира землището под GPS-а (point-in-polygon срещу granici) и го зарежда.
+// Fallback на DEFAULT_EKATTE при отказан/неуспешен GPS.
+async function locateAndLoad() {
+  const pos = await getPositionSafe();
+  if (!pos) { await loadSettlement(DEFAULT_EKATTE, true); return; }
+  const ekatte = ekatteAt(pos.lon, pos.lat);
+  if (ekatte) await loadSettlement(ekatte, false);   // имотите (ако са качени; иначе toast)
+  // винаги центрирай на реалната GPS позиция (моментално — без анимация по setData)
+  map.jumpTo({ center: [pos.lon, pos.lat], zoom: ekatte ? 15 : 12 });
+  if (!ekatte) dbg("GPS извън заредено землище");
+}
+
+function getPositionSafe() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) { resolve(null); return; }
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve({ lon: p.coords.longitude, lat: p.coords.latitude }),
+      (e) => { dbg("GPS: " + (e && e.message)); resolve(null); },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+    );
+  });
+}
+
+// Кое землище съдържа точката (от заредения granici слой).
+function ekatteAt(lon, lat) {
+  for (const ek in graniciByEkatte)
+    if (pointInFeature(lon, lat, graniciByEkatte[ek])) return ek;
+  return null;
+}
+
+function pointInFeature(lon, lat, feature) {
+  const g = feature && feature.geometry;
+  if (!g) return false;
+  const polys = g.type === "Polygon" ? [g.coordinates]
+              : g.type === "MultiPolygon" ? g.coordinates : [];
+  for (const poly of polys) if (pointInPolygon(lon, lat, poly)) return true;
+  return false;
+}
+
+// poly = [outerRing, hole1, …]; ring = [[lon,lat],…]. В дупка → извън.
+function pointInPolygon(lon, lat, poly) {
+  if (!poly.length || !inRing(lon, lat, poly[0])) return false;
+  for (let i = 1; i < poly.length; i++) if (inRing(lon, lat, poly[i])) return false;
+  return true;
+}
+
+function inRing(lon, lat, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if (((yi > lat) !== (yj > lat)) &&
+        (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
 
 // ---- Национален граничен слой (постоянен; СЪЗДАВА се post-load, всички землища) ----
 async function loadGranici() {
