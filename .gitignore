@@ -1,0 +1,13 @@
+# OS боклук
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Редактори
+*.swp
+*~
+.idea/
+.vscode/
+
+# Локални дев артефакти
+*.log

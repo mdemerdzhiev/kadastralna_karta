@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="bg">
+<head>
+<meta charset="utf-8" />
+<!-- viewport-fit=cover → активира env(safe-area-inset-*) на iPhone/iPad с notch -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Кадастрална карта — избор за трасиране</title>
+<!-- Дискретна икона (inline SVG, без външен файл) — премахва 404 за favicon -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23c0392b'/%3E%3Cpath d='M3 12L8 3l5 9z' fill='%23fff'/%3E%3C/svg%3E" />
+<!-- NB: кеширане се управлява от GitHub Pages/Telegram WebView, НЕ от HTML meta
+     (anti-cache meta таговете бяха no-op → махнати). За cache-bust при ъпдейт
+     ползвай ?v=N в TELEGRAM_MINI_APP_URL. Виж README.md. -->
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.7.3/maplibre-gl.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.7.3/maplibre-gl.min.js"></script>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+<style>
+  :root { --panel-bg: rgba(255,255,255,0.96); --accent: #c0392b; --ink: #2c3e50; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif; color: var(--ink); }
+  #map { position: absolute; inset: 0; }
+
+  /* Инфо панел за селектирания имот (горе вляво) */
+  #info {
+    position: absolute; top: max(10px, env(safe-area-inset-top));
+    left: max(10px, env(safe-area-inset-left)); z-index: 5; width: 230px;
+    background: var(--panel-bg); border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+    font-size: 12px; backdrop-filter: blur(4px); overflow: hidden;
+  }
+  #info-body { padding: 10px 12px; }
+  #info-body .hint { color: #95a5a6; }
+  #info-body h1 { font-size: 14px; margin: 0 0 7px; font-weight: 700;
+    font-variant-numeric: tabular-nums; }
+  .frow { display: flex; gap: 6px; margin: 3px 0; line-height: 1.25; }
+  .frow .k { color: #95a5a6; flex: 0 0 78px; }
+  .frow .v { flex: 1; }
+  #info-foot { display: flex; align-items: center; justify-content: space-between;
+    gap: 6px; padding: 6px 10px; border-top: 1px solid #e7e7e7; color: #95a5a6; font-size: 10.5px; }
+  #stats { font-variant-numeric: tabular-nums; }
+  #basemap-toggle { border: 1px solid #ccc; border-radius: 6px; background: #fff;
+    font-size: 10.5px; padding: 3px 7px; cursor: pointer; color: var(--ink); }
+
+  /* Кошница (горе вдясно) — само идентификатори */
+  #basket {
+    position: absolute; top: max(10px, env(safe-area-inset-top));
+    right: max(10px, env(safe-area-inset-right)); z-index: 5; width: 210px;
+    background: var(--panel-bg); border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+    display: flex; flex-direction: column; max-height: calc(100% - 20px); backdrop-filter: blur(4px);
+  }
+  #basket h2 { font-size: 13px; margin: 0; padding: 11px 12px 8px; font-weight: 700; }
+  #basket-list { list-style: none; margin: 0; padding: 0 8px; overflow-y: auto; flex: 1; }
+  #basket-list:empty::after { content: "Тапни имот на картата"; color: #aab; font-size: 12px;
+    display: block; padding: 6px 4px 12px; }
+  #basket-list li { display: flex; align-items: center; justify-content: space-between;
+    gap: 6px; padding: 6px; border-radius: 7px; font-size: 12px; }
+  #basket-list li:nth-child(odd) { background: rgba(0,0,0,0.035); }
+  #basket-list .cad { font-weight: 600; font-variant-numeric: tabular-nums; }
+  #basket-list .rm { border: none; background: #f0f0f0; border-radius: 50%; width: 20px;
+    height: 20px; cursor: pointer; color: #c0392b; font-weight: 700; line-height: 1; flex: none; }
+  #basket-foot { padding: 10px 12px; border-top: 1px solid #e2e2e2; }
+  #count { font-size: 12px; color: #7f8c8d; margin-bottom: 8px; }
+  #generate { width: 100%; padding: 11px; font-size: 14px; font-weight: 700; color: #fff;
+    background: var(--accent); border: none; border-radius: 9px; cursor: pointer; }
+  #generate:disabled { background: #ccc; cursor: default; }
+  #clear { width: 100%; padding: 6px; font-size: 11px; color: #7f8c8d; background: none;
+    border: none; cursor: pointer; margin-top: 4px; }
+
+  #tip { position: absolute; z-index: 6; pointer-events: none; display: none;
+    background: rgba(20,28,36,0.92); color: #fff; padding: 5px 8px; border-radius: 6px;
+    font-size: 11.5px; font-weight: 600; }
+
+  /* Кратко непречещо съобщение (toast) долу в средата */
+  #toast { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+    z-index: 7; background: rgba(20,28,36,0.92); color: #fff; padding: 9px 14px;
+    border-radius: 9px; font-size: 12.5px; display: none; max-width: 80%; text-align: center; }
+
+  @media (max-width: 560px) {
+    #basket { width: 158px; } #info { width: 188px; }
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="info">
+  <div id="info-body"><div class="hint">Тапни имот за данни</div></div>
+  <div id="info-foot">
+    <span id="stats">имоти: … · FPS: …</span>
+    <button id="basemap-toggle">OSM</button>
+  </div>
+</div>
+
+<div id="basket">
+  <h2 id="basket-title">За трасиране</h2>
+  <ul id="basket-list"></ul>
+  <div id="basket-foot">
+    <div id="count">0 имота</div>
+    <button id="generate" disabled>Генерирай</button>
+    <button id="clear">изчисти</button>
+  </div>
+</div>
+
+<div id="tip"></div>
+<div id="toast"></div>
+<div id="dbg" style="position:absolute;bottom:8px;left:8px;z-index:9;background:rgba(0,0,0,0.82);color:#3ad13a;font:11px/1.4 monospace;padding:6px 9px;border-radius:6px;display:none;max-width:70%;white-space:pre-wrap"></div>
+
+<script>
+"use strict";
+
+// Диагностика само при ?debug в URL-а (production URL няма флага → чисто UI).
+// За dev: http://localhost:8000/?debug  |  в Telegram: добави ?debug към URL-а.
+const DEBUG = new URLSearchParams(location.search).has("debug");
+const APP_VERSION = "2026-06-08";
+
+const GRANICI_GEOJSON = "data/granici.geojson";
+const DEFAULT_EKATTE = "81342";   // първоначално зареденото землище (слайс)
+
+// Цвят по предназначение (purptype). Урбанизираната НЕ се оцветява (по наредба) —
+// това се прави през fill-opacity по-долу, не тук.
+const FILL_COLOR = [
+  "match", ["get", "purptype"],
+  "Земеделска", "#efe09a",
+  "Урбанизирана", "#e3cba6",
+  "Горска", "#9cc081",
+  "Територия, заета от води и водни обекти", "#9ec0dd",
+  "Територия на транспорта", "#c9ccce",
+  "#dcdcdc"
+];
+// Прозрачност: селектиран → плътно; урбанизиран → 0 (само контур); иначе 0.45
+const FILL_OPACITY = [
+  "case",
+  ["boolean", ["feature-state", "selected"], false], 0.85,
+  ["==", ["get", "purptype"], "Урбанизирана"], 0,
+  0.45
+];
+
+const TG = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+if (TG) {
+  try {
+    TG.ready();
+    TG.expand();
+    // вертикалният swipe надолу затваря WebApp-а → пречи на pan на картата; изключваме
+    if (TG.disableVerticalSwipes) TG.disableVerticalSwipes();
+    // нативен бутон долу вместо HTML „Генерирай" (по-удобен на телефон, винаги видим)
+    if (TG.MainButton) {
+      TG.MainButton.setText("Генерирай").onClick(doGenerate);
+      const g = document.getElementById("generate");
+      if (g) g.style.display = "none";
+    }
+  } catch (e) {}
+}
+// Версия — видима само при ?debug (за cache-debug в Telegram WebView)
+if (DEBUG) {
+  const t = document.getElementById("basket-title");
+  if (t) t.insertAdjacentHTML("beforeend",
+    ' <span style="font-weight:400;font-size:10px;color:#27ae60">' + APP_VERSION + '</span>');
+}
+
+const selected = new Map();          // cadnum -> props
+const loaded = new Set();            // заредени землища (ЕКАТТЕ)
+const acc = { parcels: [], raioni: [], buildings: [] };  // натрупани features
+const graniciByEkatte = {};          // ЕКАТТЕ -> granici feature (за fitBounds)
+
+const map = new maplibregl.Map({
+  container: "map",
+  style: {
+    version: 8,
+    glyphs: "fonts/{fontstack}/{range}.pbf",
+    sources: {
+      osm: {
+        type: "raster",
+        tiles: ["https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                "https://b.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png"],
+        tileSize: 256, attribution: "© OpenStreetMap"
+      }
+    },
+    layers: [
+      { id: "bg", type: "background", paint: { "background-color": "#eef0f2" } },
+      { id: "osm", type: "raster", source: "osm", paint: { "raster-opacity": 0.85 } }
+    ]
+  },
+  center: [25.3, 42.7], zoom: 6.4, attributionControl: { compact: true }
+});
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+map.addControl(new maplibregl.GeolocateControl({
+  positionOptions: { enableHighAccuracy: true }, trackUserLocation: true
+}), "bottom-right");
+
+// Тиха диагностика на MapLibre грешки (glyph/tile/style провали) — видими при ?debug
+map.on("error", (e) => dbg("MAP грешка: " + ((e && e.error && e.error.message) || e)));
+
+const EMPTY = { type: "FeatureCollection", features: [] };
+
+// Диагностичен надпис на екрана (за дебъг без F12) — само при ?debug.
+// Ограничен до последните 60 реда (иначе DOM расте безкрайно при дълга сесия).
+let _dbgLines = [];
+function dbg(line) {
+  if (!DEBUG) return;
+  const el = document.getElementById("dbg");
+  if (!el) return;
+  el.style.display = "block";
+  _dbgLines.push(line);
+  if (_dbgLines.length > 60) _dbgLines = _dbgLines.slice(-60);
+  el.textContent = _dbgLines.join("\n") + "\n";
+}
+
+map.on("load", async () => {
+  map.addSource("parcels", { type: "geojson", data: EMPTY, promoteId: "cadnum" });
+  map.addSource("raioni", { type: "geojson", data: EMPTY });
+  map.addSource("buildings", { type: "geojson", data: EMPTY });
+
+  map.addLayer({ id: "parcels-fill", type: "fill", source: "parcels",
+    paint: { "fill-color": FILL_COLOR, "fill-opacity": FILL_OPACITY } });
+  map.addLayer({ id: "parcels-line", type: "line", source: "parcels",
+    paint: {
+      "line-color": ["case", ["boolean", ["feature-state", "selected"], false], "#c0392b", "#7a8a7a"],
+      "line-width": ["interpolate", ["linear"], ["zoom"],
+        13, ["case", ["boolean", ["feature-state", "selected"], false], 2.4, 0.4],
+        16, ["case", ["boolean", ["feature-state", "selected"], false], 3.0, 1.2]]
+    } });
+  map.addLayer({ id: "raioni-line", type: "line", source: "raioni",
+    paint: { "line-color": "#9a5b3f", "line-opacity": 0.85,
+      "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.0, 16, 2.2] } });
+
+  map.addLayer({ id: "buildings-fill", type: "fill", source: "buildings", minzoom: 13.5,
+    paint: { "fill-color": "#cfc7ba", "fill-opacity": 0.55, "fill-outline-color": "#a89e8d" } });
+
+  // ---- Етикети (зум-йерархия: землище → район → имот → сграда) ----
+  map.addLayer({ id: "raioni-label", type: "symbol", source: "raioni", minzoom: 12, maxzoom: 16,
+    layout: {
+      "text-field": ["to-string", ["get", "cadreg"]], "text-font": ["Open Sans Regular"],
+      "text-size": ["interpolate", ["linear"], ["zoom"], 12, 12, 16, 18], "text-allow-overlap": false
+    },
+    paint: { "text-color": "#7a3f25", "text-halo-color": "#fff", "text-halo-width": 1.6 } });
+
+  map.addLayer({ id: "parcels-label", type: "symbol", source: "parcels", minzoom: 15.5,
+    layout: {
+      "text-field": ["to-string", ["get", "pnum"]], "text-font": ["Open Sans Regular"],
+      "text-size": ["interpolate", ["linear"], ["zoom"], 15.5, 10, 18.5, 14], "text-allow-overlap": false
+    },
+    paint: { "text-color": "#34495e", "text-halo-color": "#fff", "text-halo-width": 1.3 } });
+
+  map.addLayer({ id: "buildings-label", type: "symbol", source: "buildings", minzoom: 16.5,
+    layout: {
+      "text-field": ["to-string", ["get", "num"]], "text-font": ["Open Sans Regular"],
+      "text-size": 10, "text-allow-overlap": false
+    },
+    paint: { "text-color": "#6b6256", "text-halo-color": "#fff", "text-halo-width": 1.2 } });
+
+  wireInteractions();
+  await loadSettlement(DEFAULT_EKATTE, true);     // имоти + райони + сгради (инлайн setData)
+  await loadGranici();                            // граници (инлайн setData, СЛЕД землището)
+});
+
+// ---- Национален граничен слой (постоянен; СЪЗДАВА се post-load, всички землища) ----
+async function loadGranici() {
+  if (map.getSource("granici")) return;
+  let d;
+  // 6.3 MB файл → таймаут + feedback, за да не виси безшумно на бавна мрежа.
+  const ac = new AbortController();
+  const tid = setTimeout(() => ac.abort(), 20000);
+  try {
+    const r = await fetch(GRANICI_GEOJSON, { signal: ac.signal });
+    if (!r.ok) { dbg("граници: HTTP " + r.status); toast("Землищните граници не се заредиха (" + r.status + ")"); return; }
+    d = await r.json();
+  } catch (e) {
+    const ab = e && e.name === "AbortError";
+    dbg("граници ГРЕШКА: " + (e && e.message));
+    toast(ab ? "Землищните граници се бавят — провери връзката" : "Землищните граници не се заредиха");
+    return;
+  } finally { clearTimeout(tid); }
+  if (!d || !Array.isArray(d.features)) { dbg("граници: невалиден geojson"); return; }
+  for (const f of d.features)
+    if (f.properties && f.properties.ekatte) graniciByEkatte[f.properties.ekatte] = f;
+  // tolerance: 0 → geojson-vt не опростява/изрязва контурите при отдалечаване
+  // (иначе тънките землищни граници изчезват при нисък zoom).
+  map.addSource("granici", { type: "geojson", data: d, tolerance: 0 });
+  dbg("граници: " + d.features.length);
+  // Почти прозрачно запълване — клик-таргет (opacity 0.01, НЕ 0); под имотите.
+  map.addLayer({ id: "granici-fill", type: "fill", source: "granici",
+    paint: { "fill-color": "#000", "fill-opacity": 0.01 } }, "parcels-fill");
+  // Землищна граница — изразен контур, над районните линии
+  map.addLayer({ id: "granici-line", type: "line", source: "granici",
+    paint: { "line-color": "#34406b", "line-opacity": 0.9,
+      "line-width": ["interpolate", ["linear"], ["zoom"], 7, 0.8, 12, 2.0, 16, 3.0] } },
+    "buildings-fill");
+  // Име + ЕКАТТЕ — при отдалечен zoom, под районните етикети
+  map.addLayer({ id: "granici-label", type: "symbol", source: "granici", maxzoom: 12.5,
+    layout: { "text-field": ["format",
+        ["concat", ["get", "type"], " ", ["get", "name"]], {},
+        ["concat", "\n", ["get", "ekatte"]], { "font-scale": 0.82 }],
+      "text-font": ["Open Sans Regular"], "text-size": 13, "text-allow-overlap": false },
+    paint: { "text-color": "#2c3e50", "text-halo-color": "#fff", "text-halo-width": 1.6 } },
+    "raioni-label");
+
+  // Клик в землище БЕЗ зареден имот → зареди землището (granici-fill е под имотите,
+  // затова имотните кликове печелят там, където имоти вече са заредени)
+  map.on("click", "granici-fill", (e) => {
+    const pf = map.queryRenderedFeatures(e.point, { layers: ["parcels-fill"] });
+    if (!pf.length && e.features[0].properties.ekatte)
+      loadSettlement(e.features[0].properties.ekatte, true);
+  });
+}
+
+// ---- Зареждане на землище (имоти + райони + сгради) ----
+async function loadSettlement(ekatte, fly) {
+  if (loaded.has(ekatte)) { if (fly) flyTo(ekatte); return; }
+  loaded.add(ekatte);
+  let pdata;
+  try {
+    const pr = await fetch(`data/${ekatte}.geojson`);
+    if (!pr.ok) throw new Error("nodata");
+    pdata = await pr.json();
+  } catch (e) {
+    loaded.delete(ekatte);
+    const g = graniciByEkatte[ekatte];
+    toast(`${g ? (g.properties.type + " " + g.properties.name) : ("Землище " + ekatte)} още не е заредено в системата`);
+    return;
+  }
+  acc.parcels.push(...pdata.features);
+  map.getSource("parcels").setData({ type: "FeatureCollection", features: acc.parcels });
+  dbg("имоти: " + acc.parcels.length);
+
+  // Райони + сгради — ИНЛАЙН awaited setData (НЕ `.then`) и ПРЕДИ flyTo. setData в
+  // detached promise / по време на камерна анимация не се претайлва коректно в
+  // MapLibre (точно затова районите/сградите изчезваха, а имотите — не).
+  try {
+    const rr = await fetch(`data/${ekatte}_raioni.geojson`);
+    if (!rr.ok) { dbg("район: HTTP " + rr.status); }
+    else {
+      const rd = await rr.json();
+      acc.raioni.push(...rd.features);
+      map.getSource("raioni").setData({ type: "FeatureCollection", features: acc.raioni });
+      dbg("район: " + acc.raioni.length);
+    }
+  } catch (e) { dbg("район ГРЕШКА: " + (e && e.message)); }
+  try {
+    const br = await fetch(`data/${ekatte}_sgradi.geojson`);
+    if (!br.ok) { dbg("сгради: HTTP " + br.status); }
+    else {
+      const bd = await br.json();
+      acc.buildings.push(...bd.features);
+      map.getSource("buildings").setData({ type: "FeatureCollection", features: acc.buildings });
+      dbg("сгради: " + acc.buildings.length);
+    }
+  } catch (e) { dbg("сгради ГРЕШКА: " + (e && e.message)); }
+
+  if (fly) flyTo(ekatte, pdata);
+}
+
+function flyTo(ekatte, pdata) {
+  const g = graniciByEkatte[ekatte];
+  const b = bboxOf(g ? { features: [g] } : (pdata || { features: [] }));
+  if (b) map.fitBounds(b, { padding: 40, duration: 0 });  // моментално — анимация пречи на setData
+}
+
+function bboxOf(fc) {
+  if (!fc || !Array.isArray(fc.features)) return null;
+  let minX = 180, minY = 90, maxX = -180, maxY = -90, any = false;
+  const walk = (c) => {
+    if (!Array.isArray(c)) return;
+    if (typeof c[0] === "number") { any = true;
+      if (c[0] < minX) minX = c[0]; if (c[0] > maxX) maxX = c[0];
+      if (c[1] < minY) minY = c[1]; if (c[1] > maxY) maxY = c[1];
+    } else for (const x of c) walk(x);
+  };
+  for (const f of fc.features) if (f && f.geometry && f.geometry.coordinates) walk(f.geometry.coordinates);
+  return any ? [[minX, minY], [maxX, maxY]] : null;
+}
+
+// ---- Взаимодействия ----
+function wireInteractions() {
+  const tip = document.getElementById("tip");
+  const isTouch = window.matchMedia("(pointer: coarse)").matches;
+
+  if (!isTouch) {
+    map.on("mousemove", "parcels-fill", (e) => {
+      map.getCanvas().style.cursor = "pointer";
+      const p = e.features[0].properties;
+      tip.style.display = "block";
+      tip.style.left = (e.point.x + 14) + "px";
+      tip.style.top = (e.point.y + 14) + "px";
+      tip.textContent = p.cadnum || "";
+    });
+    map.on("mouseleave", "parcels-fill", () => { map.getCanvas().style.cursor = ""; tip.style.display = "none"; });
+  }
+
+  // Имот → избор + инфо (layer-specific клик — надеждно, работи и на тъч)
+  map.on("click", "parcels-fill", (e) => { toggle(e.features[0].properties); });
+  map.on("mouseenter", "parcels-fill", () => { map.getCanvas().style.cursor = "pointer"; });
+}
+
+// ---- Избор / кошница / инфо ----
+function toggle(props) {
+  const cad = props.cadnum;
+  if (!cad) return;
+  if (TG && TG.HapticFeedback) { try { TG.HapticFeedback.impactOccurred("light"); } catch (e) {} }
+  showInfo(props);
+  if (selected.has(cad)) {
+    selected.delete(cad);
+    map.setFeatureState({ source: "parcels", id: cad }, { selected: false });
+  } else {
+    selected.set(cad, props);
+    map.setFeatureState({ source: "parcels", id: cad }, { selected: true });
+  }
+  renderBasket();
+}
+
+// Escape за стойности от geojson преди innerHTML (АГКК полета може да носят < > & и др.)
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function showInfo(p) {
+  const rows = [
+    ["Идентификатор", p.cadnum],
+    ["Парцел", p.pnum],
+    ["Квартал", p.quarter],
+    ["Вид територия", p.purptype],
+    ["НТП", p.usetype],
+    ["Собственост", p.proptype],
+    ["Адрес", p.immaddr],
+    ["Местност", p.place],
+    ["Площ", p.area != null ? fmtArea(p.area) : null]
+  ];
+  let html = '<h1>' + esc(p.cadnum || "") + '</h1>';
+  for (const [k, v] of rows.slice(1)) {
+    if (v === null || v === undefined || v === "") continue;
+    html += '<div class="frow"><span class="k">' + k + '</span><span class="v">' + esc(v) + '</span></div>';
+  }
+  document.getElementById("info-body").innerHTML = html;
+}
+
+function renderBasket() {
+  const list = document.getElementById("basket-list");
+  list.innerHTML = "";
+  for (const [cad, p] of selected) {
+    const li = document.createElement("li");
+    const s = document.createElement("span");
+    s.className = "cad"; s.textContent = cad;
+    const rm = document.createElement("button");
+    rm.className = "rm"; rm.textContent = "×"; rm.onclick = () => toggle(p);
+    li.appendChild(s); li.appendChild(rm);
+    list.appendChild(li);
+  }
+  const n = selected.size;
+  document.getElementById("count").textContent = n + " " + (n === 1 ? "имот" : "имота");
+  document.getElementById("generate").disabled = n === 0;
+  // Нативен Telegram бутон (когато сме в Telegram) — показва брой, крие се при 0
+  if (TG && TG.MainButton) {
+    if (n > 0) { TG.MainButton.setText("Генерирай (" + n + ")"); TG.MainButton.show(); }
+    else TG.MainButton.hide();
+  }
+}
+
+function doGenerate() {
+  const cadnums = [...selected.keys()];
+  if (!cadnums.length) return;
+  if (TG && TG.sendData) {
+    try {
+      TG.sendData(JSON.stringify({ action: "trase", cadnums }));
+    } catch (e) {
+      toast("Изпращането не успя: " + ((e && e.message) || e));
+      return;
+    }
+    toast("Изпратено — отварям бота…");
+    // кратко закъснение, за да се види toast-ът преди WebApp-ът да се затвори
+    setTimeout(() => { try { TG.close(); } catch (e) {} }, 400);
+  } else {
+    document.getElementById("count").textContent = "→ " + cadnums.length + " (избрани)";
+  }
+}
+document.getElementById("generate").onclick = doGenerate;
+document.getElementById("clear").onclick = () => {
+  for (const cad of selected.keys()) map.setFeatureState({ source: "parcels", id: cad }, { selected: false });
+  selected.clear();
+  renderBasket();
+  document.getElementById("info-body").innerHTML = '<div class="hint">Тапни имот за данни</div>';
+};
+
+// ---- Подложка вкл/изкл ----
+let osmOn = true;
+document.getElementById("basemap-toggle").onclick = () => {
+  osmOn = !osmOn;
+  map.setLayoutProperty("osm", "visibility", osmOn ? "visible" : "none");
+  document.getElementById("basemap-toggle").textContent = osmOn ? "OSM" : "OSM ⌀";
+};
+
+// ---- FPS ----
+let frames = 0, lastT = performance.now();
+function fpsLoop(t) {
+  frames++;
+  if (t - lastT >= 1000) {
+    document.getElementById("stats").textContent =
+      "имоти: " + acc.parcels.length + " · FPS: " + frames;
+    frames = 0; lastT = t;
+  }
+  requestAnimationFrame(fpsLoop);
+}
+requestAnimationFrame(fpsLoop);
+
+let toastTimer = null;
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg; el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = "none"; }, 3200);
+}
+
+function fmtArea(m2) {
+  const a = +m2 || 0;
+  return a >= 10000 ? (a / 1000).toFixed(1) + " дка" : Math.round(a) + " м²";
+}
+</script>
+</body>
+</html>
