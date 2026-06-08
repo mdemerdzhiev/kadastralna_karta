@@ -76,6 +76,14 @@
     z-index: 7; background: rgba(20,28,36,0.92); color: #fff; padding: 9px 14px;
     border-radius: 9px; font-size: 12.5px; display: none; max-width: 80%; text-align: center; }
 
+  /* Подкана за сваляне на незаредено землище (над toast) */
+  #dl { position: absolute; bottom: 70px; left: 50%; transform: translateX(-50%);
+    z-index: 8; background: var(--panel-bg); color: var(--ink); padding: 8px 10px;
+    border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,0.22); display: none;
+    align-items: center; gap: 8px; font-size: 12.5px; max-width: 88%; }
+  #dl button { border: none; background: var(--accent); color: #fff; font-weight: 700;
+    border-radius: 7px; padding: 7px 12px; font-size: 13px; cursor: pointer; flex: none; }
+
   @media (max-width: 560px) {
     #basket { width: 158px; } #info { width: 188px; }
   }
@@ -104,6 +112,7 @@
 
 <div id="tip"></div>
 <div id="toast"></div>
+<div id="dl"></div>
 <div id="dbg" style="position:absolute;bottom:8px;left:8px;z-index:9;background:rgba(0,0,0,0.82);color:#3ad13a;font:11px/1.4 monospace;padding:6px 9px;border-radius:6px;display:none;max-width:70%;white-space:pre-wrap"></div>
 
 <script>
@@ -184,7 +193,9 @@ const map = new maplibregl.Map({
   },
   center: [25.3, 42.7], zoom: 6.4, attributionControl: { compact: true }
 });
-map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+// showCompass: компас-бутон за север; visualizePitch + tap → reset на bearing И pitch
+// (връща картата в „нормално" положение след въртене/накланяне с пръсти).
+map.addControl(new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }), "bottom-right");
 map.addControl(new maplibregl.GeolocateControl({
   positionOptions: { enableHighAccuracy: true }, trackUserLocation: true
 }), "bottom-right");
@@ -374,9 +385,13 @@ async function loadSettlement(ekatte, fly) {
   } catch (e) {
     loaded.delete(ekatte);
     const g = graniciByEkatte[ekatte];
-    toast(`${g ? (g.properties.type + " " + g.properties.name) : ("Землище " + ekatte)} още не е заредено в системата`);
+    const label = g ? (g.properties.type + " " + g.properties.name) : ("Землище " + ekatte);
+    // В Telegram → действена подкана за сваляне; иначе само бележка.
+    if (TG && TG.sendData) showDownloadPrompt(ekatte, label);
+    else toast(label + " още не е заредено в системата");
     return;
   }
+  hideDownloadPrompt();
   acc.parcels.push(...pdata.features);
   map.getSource("parcels").setData({ type: "FeatureCollection", features: acc.parcels });
   dbg("имоти: " + acc.parcels.length);
@@ -566,6 +581,28 @@ function toast(msg) {
   el.textContent = msg; el.style.display = "block";
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.style.display = "none"; }, 3200);
+}
+
+// Подкана „Свали" за незаредено землище (само в Telegram — ползва sendData).
+function showDownloadPrompt(ekatte, label) {
+  const el = document.getElementById("dl");
+  el.innerHTML = "";
+  const span = document.createElement("span");
+  span.textContent = label + " не е заредено.";
+  const btn = document.createElement("button");
+  btn.textContent = "⬇ Свали";
+  btn.onclick = () => {
+    if (!(TG && TG.sendData)) return;
+    try { TG.sendData(JSON.stringify({ action: "download", ekatte })); }
+    catch (e) { toast("Грешка при заявката: " + ((e && e.message) || e)); }
+    // sendData затваря Mini App-а; ботът сваля и качва землището на картата
+  };
+  el.appendChild(span); el.appendChild(btn);
+  el.style.display = "flex";
+}
+function hideDownloadPrompt() {
+  const el = document.getElementById("dl");
+  if (el) el.style.display = "none";
 }
 
 function fmtArea(m2) {
