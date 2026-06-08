@@ -39,8 +39,10 @@
   #info-foot { display: flex; align-items: center; justify-content: space-between;
     gap: 6px; padding: 6px 10px; border-top: 1px solid #e7e7e7; color: #95a5a6; font-size: 10.5px; }
   #stats { font-variant-numeric: tabular-nums; }
-  #basemap-toggle { border: 1px solid #ccc; border-radius: 6px; background: #fff;
-    font-size: 10.5px; padding: 3px 7px; cursor: pointer; color: var(--ink); }
+  #basemap-toggle, #sat-toggle { border: 1px solid #ccc; border-radius: 6px; background: #fff;
+    font-size: 10.5px; padding: 3px 7px; cursor: pointer; color: var(--ink); flex: none; }
+  #basemap-toggle.active, #sat-toggle.active { background: var(--accent); color: #fff;
+    border-color: var(--accent); }
 
   /* Кошница (горе вдясно) — само идентификатори */
   #basket {
@@ -96,7 +98,8 @@
   <div id="info-body"><div class="hint">Тапни имот за данни</div></div>
   <div id="info-foot">
     <span id="stats">имоти: … · FPS: …</span>
-    <button id="basemap-toggle">OSM</button>
+    <button id="basemap-toggle" class="active">OSM</button>
+    <button id="sat-toggle">Сат</button>
   </div>
 </div>
 
@@ -121,10 +124,12 @@
 // Диагностика само при ?debug в URL-а (production URL няма флага → чисто UI).
 // За dev: http://localhost:8000/?debug  |  в Telegram: добави ?debug към URL-а.
 const DEBUG = new URLSearchParams(location.search).has("debug");
-const APP_VERSION = "2026-06-08";
+const APP_VERSION = "2026-06-09";
 
 const GRANICI_GEOJSON = "data/granici.geojson";
-const DEFAULT_EKATTE = "81342";   // първоначално зареденото землище (слайс)
+const DEFAULT_EKATTE = "81342";   // (вече НЕ се зарежда автоматично — виж locateAndLoad)
+const PLOVDIV_CENTER = [24.7453, 42.1354];   // гр. Пловдив (lon,lat) — стартов център без GPS
+const PLOVDIV_ZOOM = 11;
 
 // Цвят по предназначение (purptype). Урбанизираната НЕ се оцветява (по наредба) —
 // това се прави през fill-opacity по-долу, не тук.
@@ -145,7 +150,29 @@ const FILL_OPACITY = [
   0.45
 ];
 
-const TG = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+// telegram-web-app.js дефинира window.Telegram.WebApp ДОРИ извън Telegram (mock с
+// platform 'unknown'). Затова реалния Telegram го разпознаваме по platform — надеждно
+// и за keyboard-button web_app (за разлика от initData, който там е празен).
+const _tgWebApp = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+const TG = (_tgWebApp && _tgWebApp.platform && _tgWebApp.platform !== 'unknown') ? _tgWebApp : null;
+// Десктоп (Eel) режим: картата е в iframe → връща избора към родителя (index.html)
+// чрез postMessage (same-origin localhost). Не ползва eel.js — чисто разделение.
+const HOST = !TG && window.parent !== window;
+function postToHost(p) { try { window.parent.postMessage(p, "*"); } catch (e) {} }
+if (HOST) {
+  // Десктоп: родителят съобщава „свалих землището" → зареди го на картата.
+  window.addEventListener("message", (e) => {
+    const d = e.data || {};
+    if (d.action === "downloaded" && d.ekatte) loadSettlement(String(d.ekatte), true);
+    else if (d.action === "download_failed") {
+      hideDownloadPrompt();
+      toast(d.msg || "Землището няма отворени данни в КАИС");
+    }
+  });
+  // В десктопа „Генерирай" е подвеждащо — картата ИЗБИРА (главният прозорец генерира).
+  const g = document.getElementById("generate");
+  if (g) g.textContent = "Избери";
+}
 if (TG) {
   try {
     TG.ready();
@@ -184,11 +211,18 @@ const map = new maplibregl.Map({
                 "https://b.tile.openstreetmap.org/{z}/{x}/{y}.png",
                 "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png"],
         tileSize: 256, attribution: "© OpenStreetMap"
+      },
+      sat: {
+        type: "raster",
+        // Esri World Imagery — безплатен сателит без API key (ред {z}/{y}/{x}!)
+        tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+        tileSize: 256, maxzoom: 19, attribution: "© Esri, Maxar, Earthstar Geographics"
       }
     },
     layers: [
       { id: "bg", type: "background", paint: { "background-color": "#eef0f2" } },
-      { id: "osm", type: "raster", source: "osm", paint: { "raster-opacity": 0.85 } }
+      { id: "osm", type: "raster", source: "osm", paint: { "raster-opacity": 0.85 } },
+      { id: "sat", type: "raster", source: "sat", layout: { visibility: "none" } }
     ]
   },
   center: [25.3, 42.7], zoom: 6.4, attributionControl: { compact: true }
@@ -271,12 +305,15 @@ map.on("load", async () => {
 // Fallback на DEFAULT_EKATTE при отказан/неуспешен GPS.
 async function locateAndLoad() {
   const pos = await getPositionSafe();
-  if (!pos) { await loadSettlement(DEFAULT_EKATTE, true); return; }
-  const ekatte = ekatteAt(pos.lon, pos.lat);
-  if (ekatte) await loadSettlement(ekatte, false);   // имотите (ако са качени; иначе toast)
-  // винаги центрирай на реалната GPS позиция (моментално — без анимация по setData)
-  map.jumpTo({ center: [pos.lon, pos.lat], zoom: ekatte ? 15 : 12 });
-  if (!ekatte) dbg("GPS извън заредено землище");
+  if (pos) {
+    // Лаптопът дава местоположение → центрирай там и зареди землището под него.
+    const ekatte = ekatteAt(pos.lon, pos.lat);
+    if (ekatte) await loadSettlement(ekatte, false);
+    map.jumpTo({ center: [pos.lon, pos.lat], zoom: ekatte ? 15 : 12 });
+    return;
+  }
+  // Без местоположение → Пловдив в центъра, само землищни граници (БЕЗ имоти).
+  map.jumpTo({ center: PLOVDIV_CENTER, zoom: PLOVDIV_ZOOM });
 }
 
 function getPositionSafe() {
@@ -386,8 +423,8 @@ async function loadSettlement(ekatte, fly) {
     loaded.delete(ekatte);
     const g = graniciByEkatte[ekatte];
     const label = g ? (g.properties.type + " " + g.properties.name) : ("Землище " + ekatte);
-    // В Telegram → действена подкана за сваляне; иначе само бележка.
-    if (TG && TG.sendData) showDownloadPrompt(ekatte, label);
+    // В Telegram/десктоп → действена подкана за сваляне; иначе само бележка.
+    if ((TG && TG.sendData) || HOST) showDownloadPrompt(ekatte, label);
     else toast(label + " още не е заредено в системата");
     return;
   }
@@ -542,6 +579,8 @@ function doGenerate() {
     toast("Изпратено — отварям бота…");
     // кратко закъснение, за да се види toast-ът преди WebApp-ът да се затвори
     setTimeout(() => { try { TG.close(); } catch (e) {} }, 400);
+  } else if (HOST) {
+    postToHost({ action: "trase", cadnums });   // десктоп: родителят решава единичен/група
   } else {
     document.getElementById("count").textContent = "→ " + cadnums.length + " (избрани)";
   }
@@ -554,13 +593,17 @@ document.getElementById("clear").onclick = () => {
   document.getElementById("info-body").innerHTML = '<div class="hint">Тапни имот за данни</div>';
 };
 
-// ---- Подложка вкл/изкл ----
-let osmOn = true;
-document.getElementById("basemap-toggle").onclick = () => {
-  osmOn = !osmOn;
-  map.setLayoutProperty("osm", "visibility", osmOn ? "visible" : "none");
-  document.getElementById("basemap-toggle").textContent = osmOn ? "OSM" : "OSM ⌀";
-};
+// ---- Подложка: OSM / Сателит / без (взаимно изключващи се) ----
+let basemap = "osm";   // 'osm' | 'sat' | 'none'
+function setBasemap(which) {
+  basemap = (basemap === which) ? "none" : which;   // клик на активния → изключва
+  map.setLayoutProperty("osm", "visibility", basemap === "osm" ? "visible" : "none");
+  map.setLayoutProperty("sat", "visibility", basemap === "sat" ? "visible" : "none");
+  document.getElementById("basemap-toggle").classList.toggle("active", basemap === "osm");
+  document.getElementById("sat-toggle").classList.toggle("active", basemap === "sat");
+}
+document.getElementById("basemap-toggle").onclick = () => setBasemap("osm");
+document.getElementById("sat-toggle").onclick = () => setBasemap("sat");
 
 // ---- FPS ----
 let frames = 0, lastT = performance.now();
@@ -592,10 +635,19 @@ function showDownloadPrompt(ekatte, label) {
   const btn = document.createElement("button");
   btn.textContent = "⬇ Свали";
   btn.onclick = () => {
-    if (!(TG && TG.sendData)) return;
-    try { TG.sendData(JSON.stringify({ action: "download", ekatte })); }
-    catch (e) { toast("Грешка при заявката: " + ((e && e.message) || e)); }
-    // sendData затваря Mini App-а; ботът сваля и качва землището на картата
+    if (TG && TG.sendData) {
+      try { TG.sendData(JSON.stringify({ action: "download", ekatte })); }
+      catch (e) { toast("Грешка при заявката: " + ((e && e.message) || e)); }
+      // sendData затваря Mini App-а; ботът сваля и качва землището на картата
+    } else if (HOST) {
+      postToHost({ action: "download", ekatte });   // десктоп: родителят сваля през Eel
+      // Постоянен индикатор (свалянето от КАИС е бавно — до минута); скрива се при
+      // зареждане на землището (downloaded → loadSettlement → hideDownloadPrompt).
+      el.innerHTML = "";
+      const sp = document.createElement("span");
+      sp.textContent = "⏳ Свалям " + (label || ("землище " + ekatte)) + "… (до минута)";
+      el.appendChild(sp);
+    }
   };
   el.appendChild(span); el.appendChild(btn);
   el.style.display = "flex";
