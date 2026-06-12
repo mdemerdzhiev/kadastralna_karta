@@ -124,12 +124,14 @@
 // Диагностика само при ?debug в URL-а (production URL няма флага → чисто UI).
 // За dev: http://localhost:8000/?debug  |  в Telegram: добави ?debug към URL-а.
 const DEBUG = new URLSearchParams(location.search).has("debug");
-const APP_VERSION = "2026-06-09";
+const APP_VERSION = "2026-06-12";
 
 const GRANICI_GEOJSON = "data/granici.geojson";
 const DEFAULT_EKATTE = "81342";   // (вече НЕ се зарежда автоматично — виж locateAndLoad)
 const PLOVDIV_CENTER = [24.7453, 42.1354];   // гр. Пловдив (lon,lat) — стартов център без GPS
 const PLOVDIV_ZOOM = 11;
+const AUTOLOAD_MIN_ZOOM = 12;     // под този zoom не теглим землища автоматично
+const MAX_LOADED = 8;             // над този брой землища — разтоварваме далечните
 
 // Цвят по предназначение (purptype). Урбанизираната НЕ се оцветява (по наредба) —
 // това се прави през fill-opacity по-долу, не тук.
@@ -195,9 +197,12 @@ if (DEBUG) {
 }
 
 const selected = new Map();          // cadnum -> props
-const loaded = new Set();            // заредени землища (ЕКАТТЕ)
-const acc = { parcels: [], raioni: [], buildings: [] };  // натрупани features
+const loaded = new Set();            // заредени/зареждащи се землища (guard)
+const loadedData = new Map();        // ЕКАТТЕ -> {parcels,raioni,buildings} (за разтоварване)
+const acc = { parcels: [], raioni: [], buildings: [] };  // композити (rebuildSources)
 const graniciByEkatte = {};          // ЕКАТТЕ -> granici feature (за fitBounds)
+const graniciBbox = {};              // ЕКАТТЕ -> [minX,minY,maxX,maxY] (viewport тест)
+let manifest = null;                 // Set от ЕКАТТЕ с данни на сървъра (null → авто-зареждане изкл.)
 
 const map = new maplibregl.Map({
   container: "map",
@@ -296,9 +301,31 @@ map.on("load", async () => {
     paint: { "text-color": "#6b6256", "text-halo-color": "#fff", "text-halo-width": 1.2 } });
 
   wireInteractions();
+  await loadManifest();         // кои землища имат данни (за авто-зареждането)
   await loadGranici();          // първо границите (нужни за GPS→землище + постоянен слой)
   await locateAndLoad();        // GPS → землището под мен; fallback DEFAULT_EKATTE
+  // Авто-зареждане при местене: землищата с данни в изгледа влизат сами,
+  // без тапане. Закача се СЛЕД стартовото центриране (jumpTo горе също пали
+  // moveend) и се пуска веднъж и за стартовия изглед.
+  map.on("moveend", autoLoadVisible);
+  autoLoadVisible();
 });
+
+// ---- Манифест: кои землища имат данни на сървъра (за авто-зареждане) ----
+// Hosted: data/manifest.json се поддържа от auto-publish (github_publisher).
+// Десктоп: /map/data/manifest.json се строи от локално свалените землища.
+// Липсва/грешка → manifest остава null → авто-зареждането просто е изключено.
+async function loadManifest() {
+  try {
+    const r = await fetch("data/manifest.json", { cache: "no-cache" });
+    if (!r.ok) { dbg("манифест: HTTP " + r.status); return; }
+    const d = await r.json();
+    if (d && Array.isArray(d.settlements)) {
+      manifest = new Set(d.settlements.map(String));
+      dbg("манифест: " + manifest.size + " землища");
+    }
+  } catch (e) { dbg("манифест ГРЕШКА: " + (e && e.message)); }
+}
 
 // ---- Geolocation: отваря картата на текущите координати ----
 // Намира землището под GPS-а (point-in-polygon срещу granici) и го зарежда.
@@ -379,7 +406,12 @@ async function loadGranici() {
   } finally { clearTimeout(tid); }
   if (!d || !Array.isArray(d.features)) { dbg("граници: невалиден geojson"); return; }
   for (const f of d.features)
-    if (f.properties && f.properties.ekatte) graniciByEkatte[f.properties.ekatte] = f;
+    if (f.properties && f.properties.ekatte) {
+      graniciByEkatte[f.properties.ekatte] = f;
+      // bbox кеш — авто-зареждането тества виждащи се землища на всяко местене
+      const b = bboxOf({ features: [f] });
+      if (b) graniciBbox[f.properties.ekatte] = [b[0][0], b[0][1], b[1][0], b[1][1]];
+    }
   // tolerance: 0 → geojson-vt не опростява/изрязва контурите при отдалечаване
   // (иначе тънките землищни граници изчезват при нисък zoom).
   map.addSource("granici", { type: "geojson", data: d, tolerance: 0 });
@@ -411,7 +443,8 @@ async function loadGranici() {
 }
 
 // ---- Зареждане на землище (имоти + райони + сгради) ----
-async function loadSettlement(ekatte, fly) {
+// quiet=true (авто-зареждане при местене): без подкани/тостове при липса на данни.
+async function loadSettlement(ekatte, fly, quiet) {
   if (loaded.has(ekatte)) { if (fly) flyTo(ekatte); return; }
   loaded.add(ekatte);
   let pdata;
@@ -421,6 +454,7 @@ async function loadSettlement(ekatte, fly) {
     pdata = await pr.json();
   } catch (e) {
     loaded.delete(ekatte);
+    if (quiet) { dbg("авто-зареждане " + ekatte + ": няма данни"); return; }
     const g = graniciByEkatte[ekatte];
     const label = g ? (g.properties.type + " " + g.properties.name) : ("Землище " + ekatte);
     // В Telegram/десктоп → действена подкана за сваляне; иначе само бележка.
@@ -428,10 +462,10 @@ async function loadSettlement(ekatte, fly) {
     else toast(label + " още не е заредено в системата");
     return;
   }
-  hideDownloadPrompt();
-  acc.parcels.push(...pdata.features);
-  map.getSource("parcels").setData({ type: "FeatureCollection", features: acc.parcels });
-  dbg("имоти: " + acc.parcels.length);
+  if (!quiet) hideDownloadPrompt();
+  const entry = { parcels: pdata.features || [], raioni: [], buildings: [] };
+  loadedData.set(ekatte, entry);
+  rebuildSources();   // имотите се виждат веднага, преди райони/сгради
 
   // Райони + сгради — ИНЛАЙН awaited setData (НЕ `.then`) и ПРЕДИ flyTo. setData в
   // detached promise / по време на камерна анимация не се претайлва коректно в
@@ -441,9 +475,8 @@ async function loadSettlement(ekatte, fly) {
     if (!rr.ok) { dbg("район: HTTP " + rr.status); }
     else {
       const rd = await rr.json();
-      acc.raioni.push(...rd.features);
-      map.getSource("raioni").setData({ type: "FeatureCollection", features: acc.raioni });
-      dbg("район: " + acc.raioni.length);
+      entry.raioni = rd.features || [];
+      rebuildSources();
     }
   } catch (e) { dbg("район ГРЕШКА: " + (e && e.message)); }
   try {
@@ -451,13 +484,92 @@ async function loadSettlement(ekatte, fly) {
     if (!br.ok) { dbg("сгради: HTTP " + br.status); }
     else {
       const bd = await br.json();
-      acc.buildings.push(...bd.features);
-      map.getSource("buildings").setData({ type: "FeatureCollection", features: acc.buildings });
-      dbg("сгради: " + acc.buildings.length);
+      entry.buildings = bd.features || [];
+      rebuildSources();
     }
   } catch (e) { dbg("сгради ГРЕШКА: " + (e && e.message)); }
 
+  if (unloadFarSettlements()) rebuildSources();
   if (fly) flyTo(ekatte, pdata);
+}
+
+// Композира трите source-а от per-землище store-а. concat вместо push(...spread) —
+// спредът на 38k+ features (голям град) опира в лимита на аргументите на двигателя.
+function rebuildSources() {
+  acc.parcels = []; acc.raioni = []; acc.buildings = [];
+  for (const d of loadedData.values()) {
+    acc.parcels = acc.parcels.concat(d.parcels);
+    acc.raioni = acc.raioni.concat(d.raioni);
+    acc.buildings = acc.buildings.concat(d.buildings);
+  }
+  map.getSource("parcels").setData({ type: "FeatureCollection", features: acc.parcels });
+  map.getSource("raioni").setData({ type: "FeatureCollection", features: acc.raioni });
+  map.getSource("buildings").setData({ type: "FeatureCollection", features: acc.buildings });
+  dbg("източници: имоти " + acc.parcels.length + " · райони " + acc.raioni.length +
+      " · сгради " + acc.buildings.length);
+}
+
+// ---- Авто-зареждане при местене: землищата с данни в изгледа влизат сами ----
+let _autoLoading = false, _autoLoadAgain = false;
+async function autoLoadVisible() {
+  if (!manifest || map.getZoom() < AUTOLOAD_MIN_ZOOM) return;
+  if (_autoLoading) { _autoLoadAgain = true; return; }   // ще мине пак след края
+  const b = map.getBounds();
+  const view = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  const cx = (view[0] + view[2]) / 2, cy = (view[1] + view[3]) / 2;
+  function distToView(bb) {
+    const mx = (bb[0] + bb[2]) / 2 - cx, my = (bb[1] + bb[3]) / 2 - cy;
+    return mx * mx + my * my;
+  }
+  const want = [];
+  for (const ek in graniciBbox) {
+    if (loaded.has(ek) || !manifest.has(ek)) continue;
+    if (bboxIntersects(view, graniciBbox[ek])) want.push(ek);
+  }
+  if (!want.length) return;
+  want.sort((a, b2) => distToView(graniciBbox[a]) - distToView(graniciBbox[b2]));
+  _autoLoading = true;
+  try {
+    for (const ek of want) {
+      if (map.getZoom() < AUTOLOAD_MIN_ZOOM) break;   // отдалечил се е междувременно
+      await loadSettlement(ek, false, true);
+    }
+  } finally {
+    _autoLoading = false;
+    if (_autoLoadAgain) { _autoLoadAgain = false; autoLoadVisible(); }
+  }
+}
+
+function bboxIntersects(a, b) {
+  return a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3];
+}
+
+// Разтоварване: при повече от MAX_LOADED землища маха най-старите, които са
+// извън разширения изглед и нямат селектирани имоти (паметта на телефона).
+// Връща true ако е махнало нещо (викащият прави rebuildSources).
+function unloadFarSettlements() {
+  if (loadedData.size <= MAX_LOADED) return false;
+  const b = map.getBounds();
+  const w = b.getEast() - b.getWest(), h = b.getNorth() - b.getSouth();
+  const view = [b.getWest() - w, b.getSouth() - h, b.getEast() + w, b.getNorth() + h];
+  let removed = false;
+  for (const ek of [...loadedData.keys()]) {   // insertion order = най-старите първи
+    if (loadedData.size <= MAX_LOADED) break;
+    const bb = graniciBbox[ek];
+    if (bb && bboxIntersects(view, bb)) continue;   // близо е — остава
+    if (hasSelectionIn(ek)) continue;               // има избрани имоти — остава
+    loadedData.delete(ek);
+    loaded.delete(ek);                              // може да се зареди пак при връщане
+    removed = true;
+    dbg("разтоварено землище " + ek);
+  }
+  return removed;
+}
+
+function hasSelectionIn(ekatte) {
+  const p = ekatte + ".";
+  for (const cad of selected.keys()) if (cad.startsWith(p)) return true;
+  return false;
 }
 
 function flyTo(ekatte, pdata) {
