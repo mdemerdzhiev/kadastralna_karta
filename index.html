@@ -29,6 +29,16 @@
     background: var(--panel-bg); border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.18);
     font-size: 12px; backdrop-filter: blur(4px); overflow: hidden;
   }
+  /* Търсене по идентификатор (горе в инфо панела) */
+  #search { display: flex; gap: 5px; padding: 8px 8px 0; margin: 0; }
+  #search-input { flex: 1; min-width: 0; font: inherit; font-size: 13.5px; padding: 6px 8px;
+    border: 1px solid #cfd4d8; border-radius: 7px; background: #fff; color: var(--ink);
+    font-variant-numeric: tabular-nums; }
+  #search-input:focus { outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(192,57,43,0.18); }
+  #search-go { flex: none; border: none; border-radius: 7px; background: var(--accent);
+    color: #fff; width: 32px; cursor: pointer; display: flex; align-items: center;
+    justify-content: center; padding: 0; }
   #info-body { padding: 10px 12px; }
   #info-body .hint { color: #95a5a6; }
   #info-body h1 { font-size: 14px; margin: 0 0 7px; font-weight: 700;
@@ -95,7 +105,15 @@
 <div id="map"></div>
 
 <div id="info">
-  <div id="info-body"><div class="hint">Тапни имот за данни</div></div>
+  <form id="search" autocomplete="off">
+    <input id="search-input" type="text" inputmode="decimal" enterkeyhint="search"
+           placeholder="Идентификатор" aria-label="Търси по идентификатор" spellcheck="false" />
+    <button id="search-go" type="submit" aria-label="Търси">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round"><circle cx="7" cy="7" r="4.6"/><path d="M10.4 10.4L14 14"/></svg>
+    </button>
+  </form>
+  <div id="info-body"><div class="hint">Тапни имот или го потърси по идентификатор</div></div>
   <div id="info-foot">
     <span id="stats">имоти: … · FPS: …</span>
     <button id="basemap-toggle" class="active">OSM</button>
@@ -124,7 +142,7 @@
 // Диагностика само при ?debug в URL-а (production URL няма флага → чисто UI).
 // За dev: http://localhost:8000/?debug  |  в Telegram: добави ?debug към URL-а.
 const DEBUG = new URLSearchParams(location.search).has("debug");
-const APP_VERSION = "2026-06-12";
+const APP_VERSION = "2026-11-20";
 
 const GRANICI_GEOJSON = "data/granici.geojson";
 const DEFAULT_EKATTE = "81342";   // (вече НЕ се зарежда автоматично — виж locateAndLoad)
@@ -203,6 +221,10 @@ const acc = { parcels: [], raioni: [], buildings: [] };  // композити (
 const graniciByEkatte = {};          // ЕКАТТЕ -> granici feature (за fitBounds)
 const graniciBbox = {};              // ЕКАТТЕ -> [minX,minY,maxX,maxY] (viewport тест)
 let manifest = null;                 // Set от ЕКАТТЕ с данни на сървъра (null → авто-зареждане изкл.)
+// Слоевете съществуват едва след map „load" — търсенето може да дойде по-рано
+// (бавна мрежа на телефона), затова то изчаква това обещание.
+let _mapReadyResolve;
+const mapReady = new Promise((r) => { _mapReadyResolve = r; });
 
 const map = new maplibregl.Map({
   container: "map",
@@ -301,6 +323,7 @@ map.on("load", async () => {
     paint: { "text-color": "#6b6256", "text-halo-color": "#fff", "text-halo-width": 1.2 } });
 
   wireInteractions();
+  _mapReadyResolve();           // слоевете са тук — търсенето може да работи
   await loadManifest();         // кои землища имат данни (за авто-зареждането)
   await loadGranici();          // първо границите (нужни за GPS→землище + постоянен слой)
   await locateAndLoad();        // GPS → землището под мен; fallback DEFAULT_EKATTE
@@ -672,11 +695,73 @@ function renderBasket() {
   document.getElementById("count").textContent = n + " " + (n === 1 ? "имот" : "имота");
   document.getElementById("generate").disabled = n === 0;
   // Нативен Telegram бутон (когато сме в Telegram) — показва брой, крие се при 0
+  // 1 имот → ботът прави протокол; 2+ → групови данни за GPS-а (после пита за протоколи)
   if (TG && TG.MainButton) {
-    if (n > 0) { TG.MainButton.setText("Генерирай (" + n + ")"); TG.MainButton.show(); }
+    if (n > 0) {
+      TG.MainButton.setText(n === 1 ? "Генерирай протокол" : "Генерирай (" + n + " имота)");
+      TG.MainButton.show();
+    }
     else TG.MainButton.hide();
   }
 }
+
+// ---- Търсене по идентификатор ----
+// „40004.10.15" → зарежда землището, центрира имота и го слага в кошницата;
+// „40004.10" → района; „40004" → землището. Сграда/СОС (4–5 части) → имотът.
+// Запетаи/интервали се приемат вместо точки (клавиатурата с inputmode=decimal
+// на телефона често дава запетая).
+function normIdent(s) {
+  return String(s || "").trim().replace(/[\s,;/]+/g, ".").replace(/\.{2,}/g, ".")
+    .replace(/^\.+|\.+$/g, "");
+}
+
+function settlementLabel(ekatte) {
+  const g = graniciByEkatte[ekatte];
+  return g ? (g.properties.type + " " + g.properties.name) : ("землище " + ekatte);
+}
+
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function searchIdent(raw) {
+  const q = normIdent(raw);
+  if (!/^\d{5}(\.\d+)*$/.test(q)) { toast("Въведи идентификатор, напр. 40004.10.15"); return; }
+  const parts = q.split(".");
+  const ekatte = parts[0];
+  await mapReady;
+  if (Object.keys(graniciByEkatte).length && !graniciByEkatte[ekatte]) {
+    toast("Няма землище с ЕКАТТЕ " + ekatte); return;
+  }
+  if (parts.length === 1) { await loadSettlement(ekatte, true); return; }
+
+  await loadSettlement(ekatte, false);   // без данни → подкана „Свали" / бележка
+  // Землището може вече да се зарежда (авто-зареждане) — изчакай го да стигне.
+  for (let i = 0; i < 75 && !loadedData.has(ekatte) && loaded.has(ekatte); i++) await _sleep(200);
+  const entry = loadedData.get(ekatte);
+  if (!entry) return;
+
+  const num = (s) => String(+s);           // „053" → „53"
+  if (parts.length === 2) {
+    const rf = entry.raioni.filter((f) => f.properties && num(f.properties.cadreg) === num(parts[1]));
+    if (!rf.length) { toast("Район " + q + " не е намерен в " + settlementLabel(ekatte)); flyTo(ekatte); return; }
+    map.fitBounds(bboxOf({ features: rf }), { padding: 40, duration: 0 });
+    return;
+  }
+  const exact = parts.slice(0, 3).join(".");
+  const loose = [ekatte, num(parts[1]), num(parts[2])].join(".");
+  const f = entry.parcels.find((x) => x.properties &&
+              (x.properties.cadnum === exact || x.properties.cadnum === loose));
+  if (!f) { toast("Имот " + exact + " не е намерен в " + settlementLabel(ekatte)); flyTo(ekatte); return; }
+  map.fitBounds(bboxOf({ features: [f] }), { padding: 70, maxZoom: 18, duration: 0 });
+  if (selected.has(f.properties.cadnum)) showInfo(f.properties);
+  else toggle(f.properties);             // в кошницата — готов за „Генерирай"
+}
+
+document.getElementById("search").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const inp = document.getElementById("search-input");
+  inp.blur();                             // скрива клавиатурата на телефона
+  searchIdent(inp.value);
+});
 
 function doGenerate() {
   const cadnums = [...selected.keys()];
@@ -702,7 +787,8 @@ document.getElementById("clear").onclick = () => {
   for (const cad of selected.keys()) map.setFeatureState({ source: "parcels", id: cad }, { selected: false });
   selected.clear();
   renderBasket();
-  document.getElementById("info-body").innerHTML = '<div class="hint">Тапни имот за данни</div>';
+  document.getElementById("info-body").innerHTML =
+    '<div class="hint">Тапни имот или го потърси по идентификатор</div>';
 };
 
 // ---- Подложка: OSM / Сателит / без (взаимно изключващи се) ----
